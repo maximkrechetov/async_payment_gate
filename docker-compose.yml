@@ -1,0 +1,140 @@
+name: payment-processing
+
+x-db-environment: &db-environment
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-app}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+  POSTGRES_DB: ${POSTGRES_DB:-payments}
+
+x-app-environment: &app-environment
+  <<: *db-environment
+  APP_NAME: payment-processing-service
+  DEBUG: "false"
+  API_PREFIX: /api/v1
+  API_KEY: ${API_KEY:-super-secret-key}
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: ${RABBITMQ_USER:-app}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-app}
+  RABBITMQ_VHOST: "/"
+  OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-1.0}
+  OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-50}
+  OUTBOX_BASE_DELAY: ${OUTBOX_BASE_DELAY:-1.0}
+  OUTBOX_MAX_DELAY: ${OUTBOX_MAX_DELAY:-60.0}
+  RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+  RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-2.0}
+  GATEWAY_MIN_DELAY: ${GATEWAY_MIN_DELAY:-2.0}
+  GATEWAY_MAX_DELAY: ${GATEWAY_MAX_DELAY:-5.0}
+  GATEWAY_FAILURE_RATE: ${GATEWAY_FAILURE_RATE:-0.1}
+  WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-5.0}
+  WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-3}
+  WEBHOOK_BASE_DELAY: ${WEBHOOK_BASE_DELAY:-1.0}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-webhook-signing-secret}
+
+x-app-base: &app-base
+  image: payment-service:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+    volumes:
+      # postgres:18+ хранит кластер в /var/lib/postgresql/18/docker
+      - pgdata:/var/lib/postgresql
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-app}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-app}
+    volumes: [rabbitmqdata:/var/lib/rabbitmq]
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------- one-shot миграции: нужны только POSTGRES_* ----------
+  migrate:
+    <<: *app-base
+    command: ["alembic", "upgrade", "head"]
+    environment: *db-environment
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  api:
+    <<: *app-base
+    environment: *app-environment
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  outbox:
+    <<: *app-base
+    environment: *app-environment
+    command: ["python", "-m", "app.outbox_worker"]
+    stop_grace_period: 20s
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  consumer:
+    <<: *app-base
+    environment: *app-environment
+    command: ["faststream", "run", "app.consumer:app"]
+    stop_grace_period: 40s
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  webhook:
+    <<: *app-base
+    environment: *app-environment
+    profiles: ["demo"]
+    command: ["uvicorn", "scripts.webhook_receiver:app", "--host", "0.0.0.0", "--port", "9000"]
+    ports: ["9000:9000"]
+
+volumes:
+  pgdata:
+  rabbitmqdata:
